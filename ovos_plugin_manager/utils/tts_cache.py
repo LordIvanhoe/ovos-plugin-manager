@@ -5,11 +5,11 @@ from os.path import join, isdir
 import shutil
 from pathlib import Path
 from stat import S_ISREG, ST_MTIME, ST_MODE, ST_SIZE
-
+from datetime import datetime
 from ovos_config.locations import get_xdg_cache_save_path
 from ovos_utils.file_utils import get_cache_directory as get_tmp_cache_dir
 from ovos_utils.log import LOG
-
+from json_database import JsonConfigXDG, JsonStorageXDG
 
 def hash_sentence(sentence: str):
     """Convert the sentence into a hash value used for the file name
@@ -98,12 +98,14 @@ def _delete_oldest(entries, bytes_needed):
     return deleted_files
 
 
-def curate_cache(directory, min_free_percent=5.0, min_free_disk=50):
+def curate_cache(directory, min_free_percent=5.0, min_free_disk=50, cache=None, max_days=10):
     """Clear out the directory if needed.
 
     The curation will only occur if both the precentage and actual disk space
     is below the limit. This assumes all the files in the directory can be
     deleted as freely.
+
+    Also, files in persistent cache older than "max_days" will be purged.
 
     Args:
         directory (str): directory path that holds cached files
@@ -111,12 +113,13 @@ def curate_cache(directory, min_free_percent=5.0, min_free_disk=50):
                                   default is 5% if not specified.
         min_free_disk (float): minimum allowed disk space in MB, default
                                value is 50 MB if not specified.
+        max_days (int): maximum number of days to keep files in persistent cache. Defaults to 10.
+        cache (TextToSpeechCache): TTS cache instance.
     """
     # Simpleminded implementation -- keep a certain percentage of the
     # disk available.
     # TODO: Would be easy to add more options, like whitelisted files, etc.
     deleted_files = []
-
     if not isdir(directory):
         raise NotADirectoryError(directory)
 
@@ -137,6 +140,23 @@ def curate_cache(directory, min_free_percent=5.0, min_free_disk=50):
         entries = _get_cache_entries(directory)
         # delete as many as needed starting with the oldest
         deleted_files = _delete_oldest(entries, bytes_needed)
+
+    if cache and cache.persist:
+        deleted_files_age=[]
+        for hash_name, hash_time in cache.meta.items():
+            try:
+                if (datetime.now() - datetime.fromtimestamp(hash_time)).days>max_days:
+                    filename=hash_name + "." + cache.audio_file_type
+                    path=Path.joinpath(cache.persistent_cache_dir,filename)
+                    if os.path.isfile(path):
+                        os.remove(path)
+                    deleted_files_age.append([hash_name,path])
+            except Exception as ex:
+                LOG.error(ex)
+        for hash, hash_path in deleted_files_age:
+            cache.meta.pop(hash)
+            deleted_files.append(hash_path)
+        cache.meta.store()
 
     return deleted_files
 
@@ -224,13 +244,13 @@ class TextToSpeechCache:
         self.config = tts_config
         self.tts_name = tts_name
         self.audio_file_type = audio_file_type
-
+        self.meta = JsonStorageXDG("tts_cache", subfolder="mycroft")
         persistent_cache = self.config.get("preloaded_cache") or \
                            join(get_xdg_cache_save_path(), tts_name)
         tmp_cache = get_tmp_cache_dir(f"tts/{tts_name}")
         os.makedirs(tmp_cache, exist_ok=True)
         os.makedirs(persistent_cache, exist_ok=True)
-
+        self.max_days = self.config.get("persist_max_days", 10)
         self.persistent_cache_dir = Path(persistent_cache)
         self.temporary_cache_dir = Path(tmp_cache)
         self.cached_sentences = {}
@@ -241,6 +261,7 @@ class TextToSpeechCache:
         # only persist if utterance is spoken >= N times
         self.persist_thresh = self.config.get("persist_thresh", 1)
         self._sentence_count = {}
+        self.load_persistent_cache()
 
     def __contains__(self, sha):
         """The cache contains a SHA if it knows of it and it exists on disk."""
@@ -268,7 +289,8 @@ class TextToSpeechCache:
             sentence_hash = file_path.name.split(".")[0]
             audio_file = self.define_audio_file(sentence_hash, persistent=True)
             self.cached_sentences[sentence_hash] = audio_file, None
-
+            if sentence_hash not in self.meta : self.meta[sentence_hash]=datetime.now().timestamp()
+        self.meta.store()
     def _load_existing_phoneme_files(self):
         """Find the TTS phoneme files already in the persistent cache.
         A phoneme file is no good without an audio file to pair it with.  If
@@ -296,7 +318,7 @@ class TextToSpeechCache:
         """Remove cache data if disk space is running low."""
         try:
             files_removed = curate_cache(str(self.temporary_cache_dir),
-                                         min_free_percent=self.min_free_percent)
+                                         min_free_percent=self.min_free_percent,cache=self,max_days=self.max_days)
         except NotADirectoryError:
             LOG.info(f"Nothing to curate")
             return
@@ -311,6 +333,9 @@ class TextToSpeechCache:
             audio_file = AudioFile(
                 self.persistent_cache_dir, sentence_hash, self.audio_file_type
             )
+            if sentence_hash not in self.meta:
+                self.meta[sentence_hash]=datetime.now().timestamp() # here,to only save new persistent files in meta cache
+                self.meta.store()
         else:
             audio_file = AudioFile(
                 self.temporary_cache_dir, sentence_hash, self.audio_file_type

@@ -21,6 +21,7 @@ movements for all TTS engines (only mimic implements this in upstream)
         # would hang here
         engine.playback.stop()
 """
+from datetime import datetime
 import inspect
 import random
 import re
@@ -559,6 +560,8 @@ class TTS:
         if self.enable_cache and sentence_hash in cache:
             audio, phonemes = self.get_from_cache(sentence, **kwargs)
             self.add_metric({"metric_type": "tts.synth.finished", "cache": True})
+            cache.meta[sentence_hash]=datetime.now().timestamp() # if already exists in cache, update timestamp
+            cache.meta.store()
             return audio, phonemes
 
         # synth + cache
@@ -603,6 +606,8 @@ class TTS:
         pho_file = self._cache_phonemes(sentence, phonemes, sentence_hash)
         cache = self.get_cache(voice=voice, lang=lang)
         cache.cached_sentences[sentence_hash] = (audio_file, pho_file)
+        if sentence_hash in cache.meta : cache.meta[sentence_hash]=datetime.now().timestamp()
+        cache.meta.store()
         self.add_metric({"metric_type": "tts.synth.cached"})
 
     def get_from_cache(self, sentence, **kwargs):
